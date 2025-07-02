@@ -1,0 +1,19 @@
+{
+  "name": "zappy-ai",
+  "version": "1.0.0",
+  "description": "Zappy AI – Smart Chats. Instant Replies by Vik Tree",
+  "main": "bot.js",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js",
+    "dashboard": "node dashboard.js"
+  },
+  "author": "Vik Tree",
+  "license": "MIT",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.18",
+    "axios": "^1.7.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}

@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: zappy-ai
+    env: node
+    buildCommand: npm install
+    startCommand: node server.js
+    plan: starter
+    autoDeploy: true
+    # optional disk for persistent session
+    disk:
+      name: zappy-auth
+      mountPath: /data
+      sizeGB: 1
