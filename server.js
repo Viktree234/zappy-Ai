@@ -1,13 +1,12 @@
 /*****************************************************************
  * Zappy AI – Smart Chats. Instant Replies  by Vik Tree
- * Combined WhatsApp‑bot + dashboard for Render deployment
+ * Render-ready WhatsApp bot with dashboard & auto phone pairing
  *****************************************************************/
 
 import 'dotenv/config'
 import express from 'express'
 import fs from 'fs'
 import axios from 'axios'
-import path from 'path'
 import {
   makeWASocket,
   useMultiFileAuthState,
@@ -15,9 +14,8 @@ import {
   DisconnectReason
 } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
-import qrcode from 'qrcode-terminal'
 
-/* ─────── Render‑friendly auth location ───────────────────────── */
+/* ─────── Paths for Render ───────────────────────────── */
 const AUTH_DIR = fs.existsSync('/data') ? '/data/auth' : './auth'
 const LOG_FILE = fs.existsSync('/data') ? '/data/logs.json' : 'logs.json'
 
@@ -27,37 +25,36 @@ const TAG = '_Zappy AI – Smart Chats. Instant Replies by Vik Tree_'
 const chatMemory = {}
 let sock = null
 
-/* ─────── Express app (bot API + dashboard) ──────────────────── */
+/* ─────── Express App ────────────────────────────────── */
 const app = express()
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 app.use('/assets', express.static('assets'))
 
-/* ========== WhatsApp BOT ====================================== */
+/* ─────── WhatsApp Bot ───────────────────────────────── */
 startBot()
 
 async function startBot () {
   sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false,
-    browser: Browsers.macOS('Zappy‑AI‑Bot')
+    browser: Browsers.macOS('Zappy‑AI‑Bot'),
+    printQRInTerminal: false
   })
 
   sock.ev.on('creds.update', saveCreds)
 
-  /* === CONNECTION UPDATES + QR/PAIR CODE === */
-  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr, pairingCode }) => {
-    if (!process.env.PHONE_NUMBER && qr) {
-      console.log('Scan this QR to log in:')
-      try { qrcode.generate(qr, { small: true }) } catch {}
-    }
-
-    if (pairingCode) {
-      console.log('📲 Phone-pair code →', pairingCode)
-    }
-
+  sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
     if (connection === 'open') {
       console.log('✅ Zappy AI connected')
+
+      if (!sock.authState.creds.registered && process.env.PHONE_NUMBER) {
+        try {
+          const code = await sock.requestPairingCode(process.env.PHONE_NUMBER)
+          console.log('📲 Phone-pair code →', code)
+        } catch (e) {
+          console.error('❌ Pairing failed:', e.message)
+        }
+      }
     }
 
     if (connection === 'close') {
@@ -65,7 +62,9 @@ async function startBot () {
       if (reason !== DisconnectReason.loggedOut) {
         console.log('⟳ Reconnecting…')
         startBot()
-      } else console.log('❌ Logged out.')
+      } else {
+        console.log('❌ Logged out from WhatsApp.')
+      }
     }
   })
 
@@ -107,7 +106,7 @@ async function handleCommand (jid, text) {
 
 const send = (jid, text) => sock.sendMessage(jid, { text })
 
-/* ─────── Together AI chat call (DeepSeek) ─────────────── */
+/* ─────── Together AI Chat & Image ───────────────────── */
 async function callTogetherChat (history) {
   try {
     const { data } = await axios.post(
@@ -122,7 +121,6 @@ async function callTogetherChat (history) {
   }
 }
 
-/* ─────── Image generation ─────────────────────────────────── */
 async function genImage (prompt) {
   try {
     const { data } = await axios.post(
@@ -136,7 +134,7 @@ async function genImage (prompt) {
   }
 }
 
-/* ─────── Helpers ───────────────────────────────────────────── */
+/* ─────── Utilities ───────────────────────────────────── */
 async function fetchQuote () {
   try {
     const { data } = await axios.get('https://api.quotable.io/random')
@@ -158,7 +156,7 @@ function helpMsg () {
   return `🧠 *Zappy AI Commands*\n\n• *!help* – Show this menu\n• *!quote* – Get a motivational quote\n• *!img [prompt]* – Generate an image\n• *!reset* – Clear memory\n• Chat freely – Talk to AI\n\n${TAG}`
 }
 
-/* ========== DASHBOARD ROUTES ============================== */
+/* ─────── Dashboard Routes ───────────────────────────── */
 const DASH_PIN = process.env.BROADCAST_PASSWORD || 'admin123'
 const bannerUrl = '/assets/banner.png'
 
@@ -205,7 +203,6 @@ app.post('/broadcast', async (req, res) => {
   res.send(html(`<p>✅ Broadcast sent to ${sent} user(s).</p><a href="/">Back</a>`))
 })
 
-/* ========== PUBLIC API (/send) =============================== */
 app.post('/send', async (req, res) => {
   const { to, text } = req.body
   if (!sock) return res.status(503).send('Bot not ready')
@@ -213,6 +210,6 @@ app.post('/send', async (req, res) => {
   catch { res.status(500).send('fail') }
 })
 
-/* ========== START EXPRESS ==================================== */
+/* ─────── Start Server ───────────────────────────────── */
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => console.log(`🚀 Zappy server on ${PORT}`))
