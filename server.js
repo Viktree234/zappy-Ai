@@ -1,61 +1,62 @@
-/*****************************************************************
- * Zappy AI – Smart Chats. Instant Replies  by Vik Tree
- * Combined WhatsApp‑bot + dashboard for Render deployment
- *****************************************************************/
-
 import 'dotenv/config'
 import express from 'express'
 import fs from 'fs'
 import axios from 'axios'
 import path from 'path'
+import { Client } from 'pg'
 import {
   makeWASocket,
-  useMultiFileAuthState,
+  useSingleFileAuthState,
+  usePostgresAuthState,
   Browsers,
   DisconnectReason
 } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
 import qrcode from 'qrcode-terminal'
 
-/* ─────── Render‑friendly auth & log paths ──────────────────── */
-const AUTH_DIR = fs.existsSync('/data') ? '/data/auth' : './auth'
-const LOG_FILE = fs.existsSync('/data') ? '/data/logs.json' : 'logs.json'
+/* ─────── PostgreSQL Setup ─────── */
+const db = new Client({ connectionString: process.env.DATABASE_URL })
+await db.connect()
+await db.query(`
+  CREATE TABLE IF NOT EXISTS auth_state (
+    id TEXT PRIMARY KEY,
+    data JSONB
+  )
+`)
 
-const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
-
-/* ─────── constants ─────────────────────────────────────────── */
-const TAG         = '_Zappy AI – Smart Chats. Instant Replies by Vik Tree_'
-const WAIT_REACT  = '⏳'   // thinking
-const DONE_REACT  = '✅'   // answered
-
-const chatMemory = {}
-let sock = null
-
-/* ─────── Express app (dashboard + API) ─────────────────────── */
+/* ─────── Express Setup ─────── */
 const app = express()
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 app.use('/assets', express.static('assets'))
 
-/* ========== WhatsApp BOT ===================================== */
+const TAG = '_Zappy AI – Smart Chats. Instant Replies by Vik Tree_'
+const chatMemory = {}
+const AUTH_ID = 'zappy_auth'
+
+/* ─────── Auth using PostgreSQL ─────── */
+const { state, saveCreds } = await usePostgresAuthState({ db, tableName: 'auth_state', id: AUTH_ID })
+
+/* ========== WhatsApp Bot ========== */
 startBot()
 
+let sock = null
 async function startBot () {
   sock = makeWASocket({
     auth: state,
-    browser: Browsers.macOS('Zappy‑AI‑Bot'),
-    printQRInTerminal: false
+    printQRInTerminal: !process.env.PHONE_NUMBER,
+    browser: Browsers.macOS('Zappy‑AI‑Bot')
   })
 
   sock.ev.on('creds.update', saveCreds)
 
-  /* connection updates */
-  sock.ev.on('connection.update', ({ connection, lastDisconnect, qr, pairingCode }) => {
-    if (!process.env.PHONE_NUMBER && qr) {
-      console.log('Scan this QR to log in:')
+  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr, pairingCode }) => {
+    if (qr) {
+      console.log('Scan this QR to login:')
       try { qrcode.generate(qr, { small: true }) } catch {}
     }
-    if (pairingCode) console.log('📲 Phone‑pair code →', pairingCode)
+
+    if (pairingCode) console.log('📲 Pair Code:', pairingCode)
 
     if (connection === 'open') console.log('✅ Zappy AI connected')
     if (connection === 'close') {
@@ -67,22 +68,17 @@ async function startBot () {
     }
   })
 
-  /* incoming messages */
   sock.ev.on('messages.upsert', async ({ messages }) => {
     const m = messages[0]
     if (!m.message || m.key.fromMe) return
-
+    const jid = m.key.remoteJid
     const text = m.message.conversation ?? m.message.extendedTextMessage?.text ?? ''
-    const jid  = m.key.remoteJid
     logChat(jid, 'user', text)
 
-    /* ⏳ react immediately (“thinking…”) */
-    await sock.sendMessage(jid, { react: { text: WAIT_REACT, key: m.key } })
+    await react(jid, m.key.id, '⏳')
 
-    /* commands */
     if (text.startsWith('!')) return handleCommand(jid, text)
 
-    /* AI chat */
     if (!chatMemory[jid]) chatMemory[jid] = []
     chatMemory[jid].push({ role: 'user', content: text })
 
@@ -90,15 +86,11 @@ async function startBot () {
     chatMemory[jid].push({ role: 'assistant', content: ai })
 
     await sock.sendMessage(jid, { text: `${ai}\n\n${TAG}` })
-
-    /* ✅ mark done */
-    await sock.sendMessage(jid, { react: { text: DONE_REACT, key: m.key } })
-
     logChat(jid, 'bot', ai)
   })
 }
 
-/* ─────── command handler ───────────────────────────────────── */
+/* ─────── Commands ─────── */
 async function handleCommand (jid, text) {
   const cmd = text.trim().toLowerCase()
   if (cmd === '!help') return send(jid, helpMsg())
@@ -115,9 +107,11 @@ async function handleCommand (jid, text) {
   return send(jid, `❓ Unknown command. Type *!help*\n\n${TAG}`)
 }
 
+/* ─────── Utilities ─────── */
 const send = (jid, text) => sock.sendMessage(jid, { text })
+const react = async (jid, msgId, emoji) =>
+  sock.sendMessage(jid, { react: { text: emoji, key: { id: msgId, remoteJid: jid, fromMe: false } } })
 
-/* ─────── Together AI chat + image ───────────────────────────── */
 async function callTogetherChat (history) {
   try {
     const { data } = await axios.post(
@@ -145,7 +139,6 @@ async function genImage (prompt) {
   }
 }
 
-/* ─────── helpers ───────────────────────────────────────────── */
 async function fetchQuote () {
   try {
     const { data } = await axios.get('https://api.quotable.io/random')
@@ -155,6 +148,7 @@ async function fetchQuote () {
   }
 }
 
+const LOG_FILE = fs.existsSync('/data') ? '/data/logs.json' : 'logs.json'
 function logChat (jid, who, msg) {
   const entry = { time: new Date().toISOString(), jid, who, msg }
   let logs = []
@@ -167,9 +161,10 @@ function helpMsg () {
   return `🧠 *Zappy AI Commands*\n\n• *!help* – Show this menu\n• *!quote* – Get a motivational quote\n• *!img [prompt]* – Generate an image\n• *!reset* – Clear memory\n• Chat freely – Talk to AI\n\n${TAG}`
 }
 
-/* ─────── dashboard routes (unchanged) ──────────────────────── */
+/* ========== DASHBOARD & API ========== */
 const DASH_PIN = process.env.BROADCAST_PASSWORD || 'admin123'
 const bannerUrl = '/assets/banner.png'
+
 const html = body => `<!DOCTYPE html><html><head><title>Zappy AI Dashboard</title>
 <style>
 body{font-family:sans-serif;background:#f5f5f5;text-align:center;padding:20px}
@@ -213,7 +208,6 @@ app.post('/broadcast', async (req, res) => {
   res.send(html(`<p>✅ Broadcast sent to ${sent} user(s).</p><a href="/">Back</a>`))
 })
 
-/* ─────── /send API ─────────────────────────────────────────── */
 app.post('/send', async (req, res) => {
   const { to, text } = req.body
   if (!sock) return res.status(503).send('Bot not ready')
@@ -221,6 +215,6 @@ app.post('/send', async (req, res) => {
   catch { res.status(500).send('fail') }
 })
 
-/* ─────── start server ─────────────────────────────────────── */
+/* ========== Start Server ========== */
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => console.log(`🚀 Zappy server on ${PORT}`))
