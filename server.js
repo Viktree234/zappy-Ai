@@ -17,16 +17,11 @@ import {
 import { Boom } from '@hapi/boom'
 import qrcode from 'qrcode-terminal'
 
-/* ─────── Render‑friendly auth location ─────────────────────────
-   Render provides a writable folder at /data that survives restarts.
-   Change ./auth → /data/auth (or leave as is if you don’t mind re‑pairing)
-───────────────────────────────────────────────────────────────── */
-const AUTH_DIR = '/data/auth'   // fallback to ./auth locally
+/* ─────── Render‑friendly auth location ───────────────────────── */
+const AUTH_DIR = fs.existsSync('/data') ? '/data/auth' : './auth'
 const LOG_FILE = fs.existsSync('/data') ? '/data/logs.json' : 'logs.json'
 
-const { state, saveCreds } = await useMultiFileAuthState(
-  fs.existsSync('/data') ? AUTH_DIR : './auth'
-)
+const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
 
 const TAG = '_Zappy AI – Smart Chats. Instant Replies by Vik Tree_'
 const chatMemory = {}
@@ -36,7 +31,7 @@ let sock = null
 const app = express()
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
-app.use('/assets', express.static('assets'))   // banner.png etc.
+app.use('/assets', express.static('assets'))
 
 /* ========== WhatsApp BOT ====================================== */
 startBot()
@@ -44,34 +39,25 @@ startBot()
 async function startBot () {
   sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false,  // we handle QR printing manually below
+    printQRInTerminal: false,
     browser: Browsers.macOS('Zappy‑AI‑Bot')
   })
 
   sock.ev.on('creds.update', saveCreds)
 
-  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-    const shouldLogQR = !process.env.PHONE_NUMBER
-
-    if (shouldLogQR && qr) {
+  /* === CONNECTION UPDATES + QR/PAIR CODE === */
+  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr, pairingCode }) => {
+    if (!process.env.PHONE_NUMBER && qr) {
       console.log('Scan this QR to log in:')
-      try {
-        qrcode.generate(qr, { small: true })
-      } catch {
-        console.log('(Install qrcode-terminal to show QR nicely)')
-      }
+      try { qrcode.generate(qr, { small: true }) } catch {}
+    }
+
+    if (pairingCode) {
+      console.log('📲 Phone-pair code →', pairingCode)
     }
 
     if (connection === 'open') {
       console.log('✅ Zappy AI connected')
-      if (!sock.authState.creds.registered && process.env.PHONE_NUMBER) {
-        try {
-          const code = await sock.requestPairingCode(process.env.PHONE_NUMBER)
-          console.log('📲 Phone‑pair code →', code)
-        } catch (e) {
-          console.error('Pairing error:', e.message)
-        }
-      }
     }
 
     if (connection === 'close') {
@@ -90,10 +76,8 @@ async function startBot () {
     const jid = m.key.remoteJid
     logChat(jid, 'user', text)
 
-    /* commands */
     if (text.startsWith('!')) return handleCommand(jid, text)
 
-    /* AI chat */
     if (!chatMemory[jid]) chatMemory[jid] = []
     chatMemory[jid].push({ role: 'user', content: text })
 
@@ -123,7 +107,7 @@ async function handleCommand (jid, text) {
 
 const send = (jid, text) => sock.sendMessage(jid, { text })
 
-/* ─────── Together AI chat call (DeepSeek model) ─────────────── */
+/* ─────── Together AI chat call (DeepSeek) ─────────────── */
 async function callTogetherChat (history) {
   try {
     const { data } = await axios.post(
@@ -138,7 +122,7 @@ async function callTogetherChat (history) {
   }
 }
 
-/* ─────── Image generation ──────────────────────────────────── */
+/* ─────── Image generation ─────────────────────────────────── */
 async function genImage (prompt) {
   try {
     const { data } = await axios.post(
@@ -152,7 +136,7 @@ async function genImage (prompt) {
   }
 }
 
-/* ─────── Misc helpers ──────────────────────────────────────── */
+/* ─────── Helpers ───────────────────────────────────────────── */
 async function fetchQuote () {
   try {
     const { data } = await axios.get('https://api.quotable.io/random')
@@ -165,9 +149,7 @@ async function fetchQuote () {
 function logChat (jid, who, msg) {
   const entry = { time: new Date().toISOString(), jid, who, msg }
   let logs = []
-  try {
-    logs = JSON.parse(fs.readFileSync(LOG_FILE, 'utf8'))
-  } catch {}
+  try { logs = JSON.parse(fs.readFileSync(LOG_FILE, 'utf8')) } catch {}
   logs.push(entry)
   fs.writeFileSync(LOG_FILE, JSON.stringify(logs, null, 2))
 }
@@ -176,7 +158,7 @@ function helpMsg () {
   return `🧠 *Zappy AI Commands*\n\n• *!help* – Show this menu\n• *!quote* – Get a motivational quote\n• *!img [prompt]* – Generate an image\n• *!reset* – Clear memory\n• Chat freely – Talk to AI\n\n${TAG}`
 }
 
-/* ========== DASHBOARD ROUTES ================================ */
+/* ========== DASHBOARD ROUTES ============================== */
 const DASH_PIN = process.env.BROADCAST_PASSWORD || 'admin123'
 const bannerUrl = '/assets/banner.png'
 
@@ -202,9 +184,7 @@ app.get('/', (_, res) => res.send(html(`
 
 app.get('/logs', (_, res) => {
   let logs = []
-  try {
-    logs = JSON.parse(fs.readFileSync(LOG_FILE, 'utf8'))
-  } catch {}
+  try { logs = JSON.parse(fs.readFileSync(LOG_FILE, 'utf8')) } catch {}
   res.send(html(`<pre>${JSON.stringify(logs, null, 2)}</pre>`))
 })
 
@@ -216,7 +196,6 @@ app.get('/clear', (_, res) => {
 app.post('/broadcast', async (req, res) => {
   const { password, message } = req.body
   if (password !== DASH_PIN) return res.send(html('<p style="color:red">❌ Wrong PIN.</p><a href="/">Back</a>'))
-
   const users = [...new Set(JSON.parse(fs.readFileSync(LOG_FILE, 'utf8')).map(l => l.jid))]
   const finalMsg = `${message.trim()}\n\n${TAG}`
   let sent = 0
@@ -226,18 +205,14 @@ app.post('/broadcast', async (req, res) => {
   res.send(html(`<p>✅ Broadcast sent to ${sent} user(s).</p><a href="/">Back</a>`))
 })
 
-/* ========== PUBLIC /send API ================================= */
+/* ========== PUBLIC API (/send) =============================== */
 app.post('/send', async (req, res) => {
   const { to, text } = req.body
   if (!sock) return res.status(503).send('Bot not ready')
-  try {
-    await sock.sendMessage(to, { text })
-    res.send('ok')
-  } catch {
-    res.status(500).send('fail')
-  }
+  try { await sock.sendMessage(to, { text }); res.send('ok') }
+  catch { res.status(500).send('fail') }
 })
 
-/* ========== START EXPRESS (Render binds to process.env.PORT) === */
+/* ========== START EXPRESS ==================================== */
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => console.log(`🚀 Zappy server on ${PORT}`))
