@@ -33,14 +33,12 @@ app.use('/assets', express.static('assets'))
 const TAG = '_Zappy AI – Smart Chats. Instant Replies by Vik Tree_'
 const chatMemory = {}
 const AUTH_ID = 'zappy_auth'
+let sock = null
 
 /* ─────── Auth using PostgreSQL ─────── */
 const { state, saveCreds } = await usePostgresAuthState({ db, tableName: 'auth_state', id: AUTH_ID })
 
 /* ========== WhatsApp Bot ========== */
-startBot()
-
-let sock = null
 async function startBot () {
   sock = makeWASocket({
     auth: state,
@@ -59,40 +57,48 @@ async function startBot () {
     if (pairingCode) console.log('📲 Pair Code:', pairingCode)
 
     if (connection === 'open') console.log('✅ Zappy AI connected')
+
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
+      sock = null
       if (reason !== DisconnectReason.loggedOut) {
         console.log('⟳ Reconnecting…')
-        startBot()
-      } else console.log('❌ Logged out.')
+        await startBot()
+      } else {
+        console.log('❌ Logged out.')
+      }
     }
   })
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
-  const m = messages[0]
-  if (!m.message || m.key.fromMe) return
+    const m = messages[0]
+    if (!m.message || m.key.fromMe) return
 
-  const isGroup = m.key.remoteJid.endsWith('@g.us')
-  const mentioned = m.message?.extendedTextMessage?.contextInfo?.mentionedJid?.includes(sock.user.id)
-  if (isGroup && !mentioned) return
+    const isGroup = m.key.remoteJid.endsWith('@g.us')
+    const mentioned = m.message?.extendedTextMessage?.contextInfo?.mentionedJid?.includes(sock.user.id)
+    if (isGroup && !mentioned) return
 
-  const jid = m.key.remoteJid
-  const text = m.message.conversation ?? m.message.extendedTextMessage?.text ?? ''
-  logChat(jid, 'user', text)
+    const jid = m.key.remoteJid
+    const text = m.message.conversation ?? m.message.extendedTextMessage?.text ?? ''
+    logChat(jid, 'user', text)
 
-  await react(jid, m.key.id, '⏳')
+    await react(jid, m.key.id, '⏳')
 
-  if (text.startsWith('!')) return handleCommand(jid, text)
+    if (text.startsWith('!')) return handleCommand(jid, text)
 
-  if (!chatMemory[jid]) chatMemory[jid] = []
-  chatMemory[jid].push({ role: 'user', content: text })
+    if (!chatMemory[jid]) chatMemory[jid] = []
+    chatMemory[jid].push({ role: 'user', content: text })
 
-  const ai = await callTogetherChat(chatMemory[jid])
-  chatMemory[jid].push({ role: 'assistant', content: ai })
+    const ai = await callTogetherChat(chatMemory[jid])
+    chatMemory[jid].push({ role: 'assistant', content: ai })
 
-  await sock.sendMessage(jid, { text: `${ai}\n\n${TAG}` })
-  logChat(jid, 'bot', ai)
-})
+    await sock.sendMessage(jid, { text: `${ai}\n\n${TAG}` })
+    logChat(jid, 'bot', ai)
+  })
+
+  return sock
+}
+
 /* ─────── Commands ─────── */
 async function handleCommand (jid, text) {
   const cmd = text.trim().toLowerCase()
@@ -178,15 +184,34 @@ ul{padding:0}li{list-style:none;margin:10px 0}
 <img src="${bannerUrl}" alt="logo" style="width:200px;margin-bottom:20px"/>
 ${body}<hr><p><i>${TAG}</i></p></div></body></html>`
 
-app.get('/', (_, res) => res.send(html(`
+app.get('/', (_, res) => {
+  const status = sock ? '🟢 Bot is running' : '🔴 Bot is stopped'
+  res.send(html(`
 <h1>🤖 Zappy AI Dashboard</h1>
-<ul><li><a href="/logs">📜 View Logs</a></li><li><a href="/clear">♻️ Clear Logs</a></li></ul>
+<p>${status}</p>
+<ul>
+  <li><a href="/start">🚀 Start Bot</a></li>
+  <li><a href="/logs">📜 View Logs</a></li>
+  <li><a href="/clear">♻️ Clear Logs</a></li>
+</ul>
 <form method="POST" action="/broadcast">
   <h3>📣 Broadcast</h3>
   <input name="password" type="password" placeholder="PIN" required><br><br>
   <textarea name="message" rows="5" placeholder="Type message…"></textarea><br><br>
   <button type="submit">Send</button>
-</form>`)))
+</form>`))
+})
+
+app.get('/start', async (req, res) => {
+  if (sock) return res.send(html('<p>✅ Bot already running.</p><a href="/">Back</a>'))
+  try {
+    await startBot()
+    res.send(html('<p>🚀 Bot started. Scan QR or use pair code in terminal.</p><a href="/">Back</a>'))
+  } catch (e) {
+    console.error('Start failed:', e)
+    res.send(html('<p style="color:red">❌ Failed to start bot.</p><a href="/">Back</a>'))
+  }
+})
 
 app.get('/logs', (_, res) => {
   let logs = []
