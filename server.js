@@ -15,7 +15,13 @@ import { Boom } from '@hapi/boom'
 import qrcode from 'qrcode-terminal'
 
 /* ─────── PostgreSQL Setup ─────── */
-const db = new Client({ connectionString: process.env.DATABASE_URL })
+/* ─────── PostgreSQL Setup ─────── */
+const db = new Client({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+})
 await db.connect()
 await db.query(`
   CREATE TABLE IF NOT EXISTS auth_state (
@@ -23,6 +29,7 @@ await db.query(`
     data JSONB
   )
 `)
+
 
 /* ─────── Express Setup ─────── */
 const app = express()
