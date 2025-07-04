@@ -69,27 +69,30 @@ async function startBot () {
   })
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
-    const m = messages[0]
-    if (!m.message || m.key.fromMe) return
-    const jid = m.key.remoteJid
-    const text = m.message.conversation ?? m.message.extendedTextMessage?.text ?? ''
-    logChat(jid, 'user', text)
+  const m = messages[0]
+  if (!m.message || m.key.fromMe) return
 
-    await react(jid, m.key.id, '⏳')
+  const isGroup = m.key.remoteJid.endsWith('@g.us')
+  const mentioned = m.message?.extendedTextMessage?.contextInfo?.mentionedJid?.includes(sock.user.id)
+  if (isGroup && !mentioned) return
 
-    if (text.startsWith('!')) return handleCommand(jid, text)
+  const jid = m.key.remoteJid
+  const text = m.message.conversation ?? m.message.extendedTextMessage?.text ?? ''
+  logChat(jid, 'user', text)
 
-    if (!chatMemory[jid]) chatMemory[jid] = []
-    chatMemory[jid].push({ role: 'user', content: text })
+  await react(jid, m.key.id, '⏳')
 
-    const ai = await callTogetherChat(chatMemory[jid])
-    chatMemory[jid].push({ role: 'assistant', content: ai })
+  if (text.startsWith('!')) return handleCommand(jid, text)
 
-    await sock.sendMessage(jid, { text: `${ai}\n\n${TAG}` })
-    logChat(jid, 'bot', ai)
-  })
-}
+  if (!chatMemory[jid]) chatMemory[jid] = []
+  chatMemory[jid].push({ role: 'user', content: text })
 
+  const ai = await callTogetherChat(chatMemory[jid])
+  chatMemory[jid].push({ role: 'assistant', content: ai })
+
+  await sock.sendMessage(jid, { text: `${ai}\n\n${TAG}` })
+  logChat(jid, 'bot', ai)
+})
 /* ─────── Commands ─────── */
 async function handleCommand (jid, text) {
   const cmd = text.trim().toLowerCase()
