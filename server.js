@@ -7,13 +7,9 @@ import { Client } from 'pg'
 import pkg from '@whiskeysockets/baileys'
 const {
   makeWASocket,
-  useMultiFileAuthState,
+  usePostgresAuthState,
   DisconnectReason,
-  Browsers,
-  fetchLatestBaileysVersion,
-  useSingleFileAuthState, // fallback if needed
-  // 👇 this is what you want
-  usePostgresAuthState
+  Browsers
 } = pkg
 import { Boom } from '@hapi/boom'
 import qrcode from 'qrcode-terminal'
