@@ -4,13 +4,17 @@ import fs from 'fs'
 import axios from 'axios'
 import path from 'path'
 import { Client } from 'pg'
-import {
+import pkg from '@whiskeysockets/baileys'
+const {
   makeWASocket,
-  useSingleFileAuthState,
-  usePostgresAuthState,
+  useMultiFileAuthState,
+  DisconnectReason,
   Browsers,
-  DisconnectReason
-} from '@whiskeysockets/baileys'
+  fetchLatestBaileysVersion,
+  useSingleFileAuthState, // fallback if needed
+  // 👇 this is what you want
+  usePostgresAuthState
+} = pkg
 import { Boom } from '@hapi/boom'
 import qrcode from 'qrcode-terminal'
 
