@@ -1,3 +1,12 @@
+/*****************************************************************
+ * server.js — Zappy AI Bot + Dashboard
+ * - PostgreSQL auth state   (pgAuth.js)
+ * - Real‑time QR / pair‑code via /status   (polling from dashboard)
+ * - Group messages only if @mentioned
+ * - Emoji “⏳” reaction while thinking
+ * - Broadcast, logs, start/stop from dashboard
+ *****************************************************************/
+
 import 'dotenv/config'
 import express from 'express'
 import fs from 'fs'
@@ -8,26 +17,31 @@ import { usePostgresAuthState } from './pgAuth.js'
 import { Boom } from '@hapi/boom'
 import qrcode from 'qrcode-terminal'
 
-/* ─────────── constants / globals ─────────── */
-const TAG = '_Zappy AI – Smart Chats. Instant Replies by Vik Tree_'
-const LOG_FILE = fs.existsSync('/data') ? '/data/logs.json' : 'logs.json'
-const chatMemory = {}
-let sock = null // Baileys socket
+/* ─── constants ─────────────────────────────────────────────── */
+const TAG       = '_Zappy AI – Smart Chats. Instant Replies by Vik Tree_'
+const DATA_DIR  = fs.existsSync('/data') ? '/data' : '.'
+const LOG_FILE  = `${DATA_DIR}/logs.json`
+const DASH_PIN  = process.env.BROADCAST_PASSWORD || 'admin123'
+const bannerUrl = '/assets/banner.png'
 
-let currentQR = null
-let currentPairCode = null
+/* ─── globals ───────────────────────────────────────────────── */
+let sock               = null          // Baileys socket
+let currentQR          = null          // last QR string
+let currentPairCode    = null          // last pair code
+const chatMemory       = {}            // per‑JID memory
 
-/* ─────────── Express setup ─────────── */
+/* ─── Express app ───────────────────────────────────────────── */
 const app = express()
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 app.use('/assets', express.static('assets'))
+app.use(express.static('public'))           // (optional landing page)
 
-/* ─────────── Baileys auth via Postgres ─────────── */
+/* ─── Baileys auth via Postgres ─────────────────────────────── */
 const { state, saveCreds } = await usePostgresAuthState()
 
-/* ─────────── WhatsApp Bot ─────────── */
-async function startBot() {
+/* ─── WhatsApp bot lifecycle ───────────────────────────────── */
+async function startBot () {
   sock = makeWASocket({
     auth: state,
     printQRInTerminal: !process.env.PHONE_NUMBER,
@@ -36,50 +50,39 @@ async function startBot() {
 
   sock.ev.on('creds.update', saveCreds)
 
+  /* connection updates */
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr, pairingCode }) => {
-    if (qr) {
-      currentQR = qr
-      currentPairCode = null
-      console.log('Scan this QR to login:')
-      try { qrcode.generate(qr, { small: true }) } catch {}
-    }
-    if (pairingCode) {
-      currentPairCode = pairingCode
-      currentQR = null
-      console.log('📲 Pair Code:', pairingCode)
-    }
+    if (qr)          { currentQR = qr;     currentPairCode = null; showQR(qr) }
+    if (pairingCode) { currentPairCode = pairingCode; currentQR = null; console.log('📲 Pair Code:', pairingCode) }
+
     if (connection === 'open') {
       console.log('✅ Zappy AI connected')
-      currentQR = null
-      currentPairCode = null
+      currentQR = currentPairCode = null
     }
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
-      sock = null
-      currentQR = null
-      currentPairCode = null
+      sock = null; currentQR = currentPairCode = null
       if (reason !== DisconnectReason.loggedOut) {
         console.log('⟳ Reconnecting…')
         await startBot()
-      } else {
-        console.log('❌ Logged out.')
-      }
+      } else console.log('❌ Logged out.')
     }
   })
 
+  /* messages */
   sock.ev.on('messages.upsert', async ({ messages }) => {
     const m = messages[0]
     if (!m.message || m.key.fromMe) return
 
-    const isGroup = m.key.remoteJid.endsWith('@g.us')
+    const isGroup   = m.key.remoteJid.endsWith('@g.us')
     const mentioned = m.message?.extendedTextMessage?.contextInfo?.mentionedJid?.includes(sock.user.id)
-    if (isGroup && !mentioned) return
+    if (isGroup && !mentioned) return                                     // ignore group noise
 
-    const jid = m.key.remoteJid
+    const jid  = m.key.remoteJid
     const text = m.message.conversation ?? m.message.extendedTextMessage?.text ?? ''
 
     logChat(jid, 'user', text)
-    await react(jid, m.key.id, '⏳')
+    await react(jid, m.key.id, '⏳')                                       // thinking…
 
     if (text.startsWith('!')) return handleCommand(jid, text)
 
@@ -92,15 +95,20 @@ async function startBot() {
     await sock.sendMessage(jid, { text: `${ai}\n\n${TAG}` })
     logChat(jid, 'bot', ai)
   })
-
   return sock
 }
 
-/* ─────────── command handler ─────────── */
-async function handleCommand(jid, text) {
-  const cmd = text.trim().toLowerCase()
+/* ─── helper: pretty QR in terminal ─────────────────────────── */
+function showQR (qr) {
+  console.log('Scan this QR to login:')
+  try { qrcode.generate(qr, { small: true }) } catch { console.log(qr) }
+}
 
-  if (cmd === '!help') return send(jid, helpMsg())
+/* ─── commands ─────────────────────────────────────────────── */
+async function handleCommand (jid, txt) {
+  const cmd = txt.trim().toLowerCase()
+
+  if (cmd === '!help')  return send(jid, helpMsg())
   if (cmd === '!quote') return send(jid, `💡 ${await fetchQuote()}\n\n${TAG}`)
 
   if (cmd === '!reset') {
@@ -109,24 +117,20 @@ async function handleCommand(jid, text) {
   }
 
   if (cmd.startsWith('!img ')) {
-    const prompt = text.slice(5).trim()
+    const prompt = txt.slice(5).trim()
     const url = await genImage(prompt)
-    return sock.sendMessage(jid, {
-      image: { url },
-      caption: `🖼️ “${prompt}”\n\n${TAG}`
-    })
+    return sock.sendMessage(jid, { image: { url }, caption: `🖼️ “${prompt}”\n\n${TAG}` })
   }
-
   return send(jid, `❓ Unknown command. Type *!help*\n\n${TAG}`)
 }
 
-/* ─────────── helper wrappers ─────────── */
-const send = (jid, text) => sock.sendMessage(jid, { text })
+/* ─── wrappers ─────────────────────────────────────────────── */
+const send  = (jid, text) => sock.sendMessage(jid, { text })
+const react = (jid, id, emoji) =>
+  sock.sendMessage(jid, { react: { text: emoji, key: { id, remoteJid: jid, fromMe: false } } })
 
-const react = (jid, msgId, emoji) =>
-  sock.sendMessage(jid, { react: { text: emoji, key: { id: msgId, remoteJid: jid, fromMe: false } } })
-
-async function callTogetherChat(history) {
+/* ─── AI/chat + image + quote ──────────────────────────────── */
+async function callTogetherChat (history) {
   try {
     const { data } = await axios.post(
       process.env.TOGETHER_CHAT_URL,
@@ -139,8 +143,7 @@ async function callTogetherChat(history) {
     return '⚠️ Sorry, I cannot think right now.'
   }
 }
-
-async function genImage(prompt) {
+async function genImage (prompt) {
   try {
     const { data } = await axios.post(
       'https://api.together.xyz/v1/images/generations',
@@ -148,81 +151,55 @@ async function genImage(prompt) {
       { headers: { Authorization: `Bearer ${process.env.TOGETHER_API_KEY}` } }
     )
     return data.data[0].url
-  } catch {
-    return 'https://via.placeholder.com/512?text=Image+Error'
-  }
+  } catch { return 'https://via.placeholder.com/512?text=Image+Error' }
 }
-
-async function fetchQuote() {
+async function fetchQuote () {
   try {
     const { data } = await axios.get('https://api.quotable.io/random')
     return `"${data.content}" — ${data.author}`
-  } catch {
-    return 'Keep going. You are amazing!'
-  }
+  } catch { return 'Keep going. You are amazing!' }
 }
 
-/* ─────────── logging to file ─────────── */
-function logChat(jid, who, msg) {
+/* ─── logs file ────────────────────────────────────────────── */
+function logChat (jid, who, msg) {
   const entry = { time: new Date().toISOString(), jid, who, msg }
   let logs = []
-  try {
-    logs = JSON.parse(fs.readFileSync(LOG_FILE, 'utf8'))
-  } catch {}
+  try { logs = JSON.parse(fs.readFileSync(LOG_FILE, 'utf8')) } catch {}
   logs.push(entry)
   fs.writeFileSync(LOG_FILE, JSON.stringify(logs, null, 2))
 }
 
-/* ─────────── help text ─────────── */
-function helpMsg() {
-  return `🧠 *Zappy AI Commands*\n\n• *!help* – Show this menu\n• *!quote* – Get a motivational quote\n• *!img [prompt]* – Generate an image\n• *!reset* – Clear memory\n• Chat freely – Talk to AI\n\n${TAG}`
-}
-
-/* ─────────── simple HTML template ─────────── */
-const DASH_PIN = process.env.BROADCAST_PASSWORD || 'admin123'
-const bannerUrl = '/assets/banner.png'
-
-const html = (body) => `<!DOCTYPE html><html><head><title>Zappy AI Dashboard</title>
+/* ─── static HTML builder ─────────────────────────────────── */
+function html (body) {
+  return `<!DOCTYPE html><html><head><title>Zappy AI Dashboard</title>
 <style>
 body{font-family:sans-serif;background:#f5f5f5;text-align:center;padding:20px}
 h1{color:#d62828}.cn{max-width:700px;margin:auto;background:#fff;padding:20px;border-radius:10px;box-shadow:0 0 10px #ccc}
 textarea{width:100%;padding:10px}input{padding:6px}button{background:#d62828;color:#fff;border:none;padding:10px 20px;border-radius:5px}
-ul{padding:0}li{list-style:none;margin:10px 0}
-#qr-code img { width: 200px; height: 200px; }
+ul{padding:0}li{list-style:none;margin:10px 0}#qr img{width:200px;height:200px}
 </style></head><body><div class="cn">
-<img src="${bannerUrl}" alt="logo" style="width:200px;margin-bottom:20px"/>
-${body}<hr><p><i>${TAG}</i></p></div>
+<img src="${bannerUrl}" alt="logo" style="width:200px;margin-bottom:20px"/>${body}
+<hr><p><i>${TAG}</i></p></div>
 
 <script>
-async function checkStatus() {
-  const res = await fetch('/status')
-  const data = await res.json()
-  document.getElementById('status').textContent = data.running ? '🟢 Bot is running' : '🔴 Bot is stopped'
-
-  const pairing = document.getElementById('pairing')
-  if (data.qr) {
-    // Show QR as image
-    pairing.innerHTML = '<div id="qr-code"><img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(data.qr) + '" alt="QR Code"/></div>'
-  } else if (data.pairingCode) {
-    pairing.innerHTML = '<p><b>📲 Pairing Code:</b> ' + data.pairingCode + '</p>'
-  } else {
-    pairing.innerHTML = ''
-  }
+async function poll(){
+  const r = await fetch('/status'); const d = await r.json()
+  document.getElementById('st').textContent = d.running ? '🟢 Bot running' : '🔴 Bot stopped'
+  const box = document.getElementById('pair')
+  if(d.qr)      box.innerHTML='<div id="qr"><img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data='+encodeURIComponent(d.qr)+'"/></div>'
+  else if(d.pairingCode) box.innerHTML='<p><b>📲 Pair Code:</b> '+d.pairingCode+'</p>'
+  else        box.innerHTML=''
+}
+setInterval(poll,3000); poll()
+</script></body></html>`
 }
 
-checkStatus()
-setInterval(checkStatus, 3000)
-</script>
-
-</body></html>`
-
-/* ─────────── dashboard routes ─────────── */
+/* ─── dashboard ------------------------------------------------ */
 app.get('/', (_, res) => {
-  const status = sock ? '🟢 Bot is running' : '🔴 Bot is stopped'
   res.send(html(`
 <h1>🤖 Zappy AI Dashboard</h1>
-<p id="status">${status}</p>
-<div id="pairing"></div>
+<p id="st">${sock ? '🟢 Bot running' : '🔴 Bot stopped'}</p>
+<div id="pair"></div>
 <ul>
   <li><a href="/start">🚀 Start Bot</a></li>
   <li><a href="/logs">📜 View Logs</a></li>
@@ -233,61 +210,39 @@ app.get('/', (_, res) => {
   <input name="password" type="password" placeholder="PIN" required><br><br>
   <textarea name="message" rows="5" placeholder="Type message…"></textarea><br><br>
   <button type="submit">Send</button>
-</form>
-`))
+</form>`))
 })
 
 app.get('/start', async (_, res) => {
   if (sock) return res.send(html('<p>✅ Bot already running.</p><a href="/">Back</a>'))
-  try {
-    await startBot()
-    res.send(html('<p>🚀 Bot started. Scan QR or use pair code (shown below on main page).</p><a href="/">Back</a>'))
-  } catch (e) {
-    console.error('Start failed:', e)
-    res.send(html('<p style="color:red">❌ Failed to start bot.</p><a href="/">Back</a>'))
-  }
+  try { await startBot(); res.redirect('/') }
+  catch { res.send(html('<p style="color:red">❌ Failed to start bot.</p><a href="/">Back</a>')) }
 })
-
-app.get('/status', (_, res) => {
-  res.json({
-    running: !!sock,
-    qr: currentQR,
-    pairingCode: currentPairCode
-  })
-})
-
-app.get('/logs', (_, res) => {
-  let logs = []
-  try { logs = JSON.parse(fs.readFileSync(LOG_FILE, 'utf8')) } catch {}
-  res.send(html(`<pre>${JSON.stringify(logs, null, 2)}</pre>`))
-})
-
-app.get('/clear', (_, res) => {
-  fs.writeFileSync(LOG_FILE, '[]')
-  res.send(html('<p>✅ Logs cleared.</p><a href="/">Back</a>'))
-})
-
-app.post('/broadcast', async (req, res) => {
+app.get('/status', (_, res) => res.json({ running: !!sock, qr: currentQR, pairingCode: currentPairCode }))
+app.get('/logs',   (_, res) => { let l=[]; try{l=JSON.parse(fs.readFileSync(LOG_FILE,'utf8'))}catch{} res.send(html(`<pre>${JSON.stringify(l,null,2)}</pre>`))})
+app.get('/clear',  (_, res) => { fs.writeFileSync(LOG_FILE,'[]'); res.redirect('/')})
+app.post('/broadcast', async (req,res)=>{
   const { password, message } = req.body
-  if (password !== DASH_PIN) return res.send(html('<p style="color:red">❌ Wrong PIN.</p><a href="/">Back</a>'))
-  if (!sock) return res.send(html('<p style="color:red">❌ Bot not running.</p><a href="/">Back</a>'))
-
-  const users = [...new Set(JSON.parse(fs.readFileSync(LOG_FILE, 'utf8')).map(l => l.jid))]
-  const msg = `${message.trim()}\n\n${TAG}`
-  let sent = 0
-  for (const jid of users) {
-    try { await sock.sendMessage(jid, { text: msg }); sent++ } catch {}
-  }
+  if(password!==DASH_PIN) return res.send(html('<p style="color:red">❌ Wrong PIN.</p><a href="/">Back</a>'))
+  if(!sock) return res.send(html('<p style="color:red">❌ Bot not running.</p><a href="/">Back</a>'))
+  const users=[...new Set(JSON.parse(fs.readFileSync(LOG_FILE,'utf8')).map(x=>x.jid))]
+  let sent=0
+  for(const jid of users){ try{ await sock.sendMessage(jid,{text:`${message.trim()}\n\n${TAG}`}); sent++ }catch{} }
   res.send(html(`<p>✅ Broadcast sent to ${sent} user(s).</p><a href="/">Back</a>`))
 })
 
-app.post('/send', async (req, res) => {
+/* ─── /send API ─────────────────────────────────────────────── */
+app.post('/send', async (req,res)=>{
   const { to, text } = req.body
-  if (!sock) return res.status(503).send('Bot not ready')
-  try { await sock.sendMessage(to, { text }); res.send('ok') }
-  catch { res.status(500).send('fail') }
+  if(!sock) return res.status(503).send('Bot not ready')
+  try{ await sock.sendMessage(to,{text}); res.send('ok') }catch{ res.status(500).send('fail') }
 })
 
-/* ─────────── start server ─────────── */
+/* ─── launch server ─────────────────────────────────────────── */
 const PORT = process.env.PORT || 4000
-app.listen(PORT, () => console.log(`🚀 Zappy server running on ${PORT}`))
+app.listen(PORT, ()=>console.log(`🚀 Zappy server running on ${PORT}`))
+
+/* ─── help text for bot ─────────────────────────────────────── */
+function helpMsg(){
+  return `🧠 *Zappy AI Commands*\n\n• *!help* – Show this menu\n• *!quote* – Get a motivational quote\n• *!img [prompt]* – Generate an image\n• *!reset* – Clear memory\n• Chat freely – Talk to AI\n\n${TAG}`
+}
